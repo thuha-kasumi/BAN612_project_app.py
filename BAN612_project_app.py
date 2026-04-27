@@ -14,7 +14,7 @@ MASTER_SHEET = "master_jobs"
 RAW_SHEET = "raw_jobs_archive"
 LOG_SHEET = "run_log"
 
-ROLE_FOCUS_OPTIONS = ["Strategic", "Technical", "Hybrid"]
+ROLE_FOCUS_OPTIONS = ["Hybrid", "Strategic", "Technical"]
 
 INDUSTRY_OPTIONS = [
     "High Tech",
@@ -27,6 +27,17 @@ INDUSTRY_OPTIONS = [
     "Education",
     "Other"
 ]
+
+SKILL_OPTIONS = [
+    "python", "sql", "excel", "tableau", "power bi", "dashboard", "r", "sas",
+    "machine learning", "analytics", "data analysis", "data science", "etl",
+    "stakeholder management", "communication", "financial modeling", "strategy",
+    "consulting", "project management", "powerpoint", "stakeholder", "client",
+    "business case", "operating model", "transformation", "automation",
+    "advisory", "management consulting", "roadmap"
+]
+
+DEFAULT_SITE_OPTIONS = ["linkedin", "indeed", "glassdoor"]
 
 STATE_ABBR = {
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA",
@@ -56,7 +67,7 @@ SKILL_PATTERNS = {
     "ai_required": [r"\bartificial intelligence\b", r"\bgenerative ai\b", r"\bllm\b", r"\bai\b"],
     "communication_required": [r"\bcommunication\b", r"\bstakeholder\b", r"\bpresentation\b"],
     "strategy_required": [r"\bstrategy\b", r"\bstrategic\b"],
-    "consulting_required": [r"\bconsulting\b", r"\bconsultant\b"],
+    "consulting_required": [r"\bconsulting\b", r"\bconsultant\b", r"\bmanagement consulting\b"],
 }
 
 EXP_PATTERNS = {
@@ -81,6 +92,9 @@ DEFAULT_COLUMNS = [
     "industry_tag",
     "role_focus_tag",
     "search_term",
+    "search_skills",
+    "search_companies",
+    "search_locations",
     "team_member",
     "salary_min",
     "salary_max",
@@ -105,6 +119,15 @@ DEFAULT_COLUMNS = [
     "missing_description_flag",
     "description",
 ]
+
+
+def init_state():
+    if "raw_jobs_df" not in st.session_state:
+        st.session_state["raw_jobs_df"] = None
+    if "clean_jobs_df" not in st.session_state:
+        st.session_state["clean_jobs_df"] = None
+    if "search_summary" not in st.session_state:
+        st.session_state["search_summary"] = None
 
 
 def normalize_text(value):
@@ -143,19 +166,15 @@ def parse_city_state(location_raw):
         return "", ""
 
     text = str(location_raw).strip()
-
-    # Remove common noise
     text = re.sub(r"\s*\(.*?\)\s*", " ", text).strip()
     text = re.sub(r"\s+", " ", text)
 
-    # Remote / hybrid only
     lowered = text.lower()
     if lowered in ["remote", "hybrid", "united states", "usa"]:
         return "", ""
 
     parts = [p.strip() for p in text.split(",") if p.strip()]
 
-    # Case 1: "San Francisco, CA"
     if len(parts) >= 2:
         city = parts[0]
         state_part = parts[1].split()[0].strip()
@@ -167,26 +186,18 @@ def parse_city_state(location_raw):
         if state_name in STATE_NAME_TO_ABBR:
             return city, STATE_NAME_TO_ABBR[state_name]
 
-    # Case 2: "San Francisco CA"
     tokens = text.split()
     if len(tokens) >= 2 and tokens[-1].upper() in STATE_ABBR:
-        state = tokens[-1].upper()
-        city = " ".join(tokens[:-1]).strip()
-        return city, state
+        return " ".join(tokens[:-1]).strip(), tokens[-1].upper()
 
-    # Case 3: "San Francisco California"
     if len(tokens) >= 2:
         maybe_state = " ".join(tokens[-2:]).lower()
         if maybe_state in STATE_NAME_TO_ABBR:
-            state = STATE_NAME_TO_ABBR[maybe_state]
-            city = " ".join(tokens[:-2]).strip()
-            return city, state
+            return " ".join(tokens[:-2]).strip(), STATE_NAME_TO_ABBR[maybe_state]
 
         maybe_state = tokens[-1].lower()
         if maybe_state in STATE_NAME_TO_ABBR:
-            state = STATE_NAME_TO_ABBR[maybe_state]
-            city = " ".join(tokens[:-1]).strip()
-            return city, state
+            return " ".join(tokens[:-1]).strip(), STATE_NAME_TO_ABBR[maybe_state]
 
     return text, ""
 
@@ -255,36 +266,26 @@ def annualize_salary(min_val, max_val, interval):
 
 
 def parse_salary_from_description(description):
-    """
-    Returns:
-    salary_min, salary_max, salary_currency, salary_interval, salary_source
-    """
     if pd.isna(description) or not str(description).strip():
         return None, None, None, None, None
 
-    text = str(description)
+    text = str(description).replace(",", "")
 
-    # Normalize commas
-    text_clean = text.replace(",", "")
-
-    # Range with interval, e.g. "$120000 - $150000 a year"
     patterns = [
-        r"\$ ?(\d+(?:\.\d+)?)\s*[-to]+\s*\$ ?(\d+(?:\.\d+)?)\s*(?:per|a)?\s*(hour|year|month|week|day)",
+        r"\$ ?(\d+(?:\.\d+)?)\s*[-–to]+\s*\$ ?(\d+(?:\.\d+)?)\s*(?:per|a)?\s*(hour|year|month|week|day)",
         r"\$ ?(\d+(?:\.\d+)?)\s*[-–]\s*\$ ?(\d+(?:\.\d+)?)\s*(hour|year|month|week|day)",
     ]
     for pattern in patterns:
-        match = re.search(pattern, text_clean, flags=re.IGNORECASE)
+        match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            g = match.groups()
-            min_val = float(g[0])
-            max_val = float(g[1])
-            interval = g[2].lower()
+            min_val = float(match.group(1))
+            max_val = float(match.group(2))
+            interval = match.group(3).lower()
             interval = {"hour": "hourly", "year": "yearly", "month": "monthly", "week": "weekly", "day": "daily"}[interval]
             return min_val, max_val, "USD", interval, "description"
 
-    # Single amount with interval, e.g. "$65 an hour" or "$130000 a year"
     pattern_single = r"\$ ?(\d+(?:\.\d+)?)\s*(?:per|a)?\s*(hour|year|month|week|day)"
-    match = re.search(pattern_single, text_clean, flags=re.IGNORECASE)
+    match = re.search(pattern_single, text, flags=re.IGNORECASE)
     if match:
         amount = float(match.group(1))
         interval = match.group(2).lower()
@@ -294,7 +295,30 @@ def parse_salary_from_description(description):
     return None, None, None, None, None
 
 
-def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_tag):
+def build_search_term(target_roles, companies, locations, selected_skills):
+    parts = []
+
+    if target_roles.strip():
+        parts.append(target_roles.strip())
+
+    if companies.strip():
+        company_terms = [x.strip() for x in companies.split(",") if x.strip()]
+        if company_terms:
+            parts.append(" ".join(company_terms))
+
+    if locations.strip():
+        location_terms = [x.strip() for x in locations.split(",") if x.strip()]
+        if location_terms:
+            parts.append(" ".join(location_terms))
+
+    if selected_skills:
+        parts.append(" ".join(selected_skills))
+
+    return " ".join(parts).strip()
+
+
+def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_tag,
+                     search_skills="", search_companies="", search_locations=""):
     if raw_df is None or raw_df.empty:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
 
@@ -332,9 +356,11 @@ def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_
     df["search_term"] = search_term
     df["industry_tag"] = industry_tag
     df["role_focus_tag"] = role_focus_tag
+    df["search_skills"] = search_skills
+    df["search_companies"] = search_companies
+    df["search_locations"] = search_locations
     df["salary_source"] = "structured"
 
-    # Fallback salary parsing from description where structured salary is missing
     desc_salary = df["description"].apply(parse_salary_from_description)
     df["desc_salary_min"] = desc_salary.apply(lambda x: x[0])
     df["desc_salary_max"] = desc_salary.apply(lambda x: x[1])
@@ -343,7 +369,6 @@ def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_
     df["desc_salary_source"] = desc_salary.apply(lambda x: x[4])
 
     missing_structured = df["salary_min"].isna() & df["salary_max"].isna()
-
     df.loc[missing_structured, "salary_min"] = df.loc[missing_structured, "desc_salary_min"]
     df.loc[missing_structured, "salary_max"] = df.loc[missing_structured, "desc_salary_max"]
     df.loc[missing_structured, "salary_currency"] = df.loc[missing_structured, "desc_salary_currency"]
@@ -369,16 +394,16 @@ def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_
         df["description"].isna() | (df["description"].astype(str).str.strip() == "")
     ).astype(int)
 
-    drop_helper_cols = [
-        "desc_salary_min", "desc_salary_max", "desc_salary_currency",
-        "desc_salary_interval", "desc_salary_source"
-    ]
-    df = df.drop(columns=[c for c in drop_helper_cols if c in df.columns], errors="ignore")
+    df = df.drop(columns=[
+        c for c in [
+            "desc_salary_min", "desc_salary_max", "desc_salary_currency",
+            "desc_salary_interval", "desc_salary_source"
+        ] if c in df.columns
+    ], errors="ignore")
 
     df = ensure_columns(df, DEFAULT_COLUMNS)
     df = df[DEFAULT_COLUMNS].copy()
     df = df.drop_duplicates(subset=["job_uid"], keep="first")
-
     return df
 
 
@@ -407,14 +432,12 @@ def append_unique_rows(conn, worksheet, new_df, key_col="job_uid"):
 
     updated = pd.concat([existing, to_save], ignore_index=True)
     conn.update(worksheet=worksheet, data=updated)
-
     return len(to_save), duplicates_skipped
 
 
 def log_run(conn, payload):
-    old_log = read_sheet_safe(conn, LOG_SHEET)
-    new_log = pd.DataFrame([payload])
-    updated = pd.concat([old_log, new_log], ignore_index=True)
+    existing = read_sheet_safe(conn, LOG_SHEET)
+    updated = pd.concat([existing, pd.DataFrame([payload])], ignore_index=True)
     conn.update(worksheet=LOG_SHEET, data=updated)
 
 
@@ -422,16 +445,37 @@ def initialize_sheet_tabs(conn):
     empty_master = pd.DataFrame(columns=DEFAULT_COLUMNS)
     empty_raw = pd.DataFrame(columns=["date_scraped", "team_member", "search_term"])
     empty_log = pd.DataFrame(columns=[
-        "run_id", "run_timestamp", "team_member", "search_term", "location", "sites",
-        "results_requested", "raw_scraped", "unique_in_run", "already_in_master",
-        "saved_to_master", "duplicates_skipped", "missing_salary", "missing_description",
+        "run_id", "run_timestamp", "team_member", "search_term", "results_requested",
+        "raw_scraped", "unique_in_run", "already_in_master", "saved_to_master",
+        "duplicates_skipped", "missing_salary", "missing_description",
         "industry_tag", "role_focus_tag"
     ])
-
     conn.update(worksheet=MASTER_SHEET, data=empty_master)
     conn.update(worksheet=RAW_SHEET, data=empty_raw)
     conn.update(worksheet=LOG_SHEET, data=empty_log)
 
+
+init_state()
+
+st.markdown("""
+<style>
+div[data-testid="stButton"] > button[kind="primary"] {
+    background-color: #d32f2f;
+    color: white;
+    border: none;
+}
+div[data-testid="stButton"] > button[kind="primary"]:hover {
+    background-color: #b71c1c;
+    color: white;
+}
+.small-grey {
+    color: #808080;
+    font-size: 0.9rem;
+    margin-top: -10px;
+    margin-bottom: 8px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("BAN 612 Collaborative Job Scraper")
 st.caption("Scrape -> standardize -> review -> save only unique rows")
@@ -440,32 +484,76 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 with st.sidebar:
     st.header("Search setup")
-    team_member = st.text_input("Teammate Name")
-    search_term = st.text_input("Search Term", value="Data Analyst")
-    location = st.text_input("Location", value="United States")
-    site_names = st.multiselect(
-        "Job Sites",
-        ["linkedin", "indeed", "glassdoor"],
-        default=["linkedin", "indeed"]
+
+    team_member = st.text_input("Name *", placeholder="please input your name")
+    st.markdown('<div class="small-grey">Please input your name</div>', unsafe_allow_html=True)
+
+    selected_industries = st.multiselect("Industry", INDUSTRY_OPTIONS)
+    other_industry = ""
+    if "Other" in selected_industries:
+        other_industry = st.text_input("Other Industry", placeholder="please input your industry")
+
+    selected_role_focus = st.multiselect("Role Focus", ROLE_FOCUS_OPTIONS)
+
+    target_roles = st.text_input(
+        "Target roles",
+        placeholder="please input your search key-words, separated by comma. For example: Financial consultant"
     )
-    results_wanted = st.number_input("Results Wanted", min_value=10, max_value=200, value=50, step=10)
-    industry_tag = st.selectbox("Industry Tag", INDUSTRY_OPTIONS)
-    role_focus_tag = st.selectbox("Role Focus Tag", ROLE_FOCUS_OPTIONS)
+
+    selected_skills = st.multiselect("Skills (Optional)", SKILL_OPTIONS)
+
+    preferred_companies = st.text_input(
+        "Companies (Optional)",
+        placeholder="please input your preferred companies, separated by comma"
+    )
+
+    preferred_locations = st.text_input(
+        "Location (Optional)",
+        placeholder="please input your preferred cities / states, separated by comma"
+    )
+
+    site_names = st.multiselect(
+        "Job Sites (Optional)",
+        DEFAULT_SITE_OPTIONS,
+        default=DEFAULT_SITE_OPTIONS
+    )
+
+    results_wanted = st.number_input(
+        "Number of results wanted",
+        min_value=10,
+        max_value=200,
+        value=20,
+        step=10
+    )
+    st.markdown('<div class="small-grey">Please input number only</div>', unsafe_allow_html=True)
 
     st.divider()
     if st.button("Initialize / Reset 3 tabs"):
         initialize_sheet_tabs(conn)
-        st.success("Tabs initialized: master_jobs, raw_jobs_archive, run_log")
+        st.success("Tabs initialized.")
 
-run_search = st.button("Run Search", type="primary")
+industry_tag = ", ".join([x for x in selected_industries if x != "Other"] + ([other_industry.strip()] if other_industry.strip() else []))
+role_focus_tag = ", ".join(selected_role_focus)
+search_skills_str = ", ".join(selected_skills)
+search_term = build_search_term(target_roles, preferred_companies, preferred_locations, selected_skills)
+
+run_search = st.button("Run Search")
 
 if run_search:
     if not team_member.strip():
-        st.error("Please enter your teammate name.")
+        st.error("Name is required.")
         st.stop()
 
-    if not search_term.strip():
-        st.error("Please enter a search term.")
+    if not target_roles.strip():
+        st.error("Target roles is required.")
+        st.stop()
+
+    if not selected_industries and not other_industry.strip():
+        st.error("Please select at least one industry.")
+        st.stop()
+
+    if not selected_role_focus:
+        st.error("Please select at least one role focus.")
         st.stop()
 
     if not site_names:
@@ -476,7 +564,7 @@ if run_search:
         raw_jobs = scrape_jobs(
             site_name=site_names,
             search_term=search_term,
-            location=location,
+            location="United States",
             results_wanted=results_wanted,
         )
 
@@ -489,13 +577,35 @@ if run_search:
         team_member=team_member,
         search_term=search_term,
         industry_tag=industry_tag,
-        role_focus_tag=role_focus_tag
+        role_focus_tag=role_focus_tag,
+        search_skills=search_skills_str,
+        search_companies=preferred_companies,
+        search_locations=preferred_locations
     )
 
     existing_master = read_sheet_safe(conn, MASTER_SHEET)
     existing_keys = set(existing_master["job_uid"].astype(str).tolist()) if not existing_master.empty and "job_uid" in existing_master.columns else set()
 
     clean_jobs["already_in_master"] = clean_jobs["job_uid"].astype(str).isin(existing_keys).astype(int)
+
+    st.session_state["raw_jobs_df"] = raw_jobs.copy()
+    st.session_state["clean_jobs_df"] = clean_jobs.copy()
+    st.session_state["search_summary"] = {
+        "team_member": team_member,
+        "search_term": search_term,
+        "results_requested": results_wanted,
+        "industry_tag": industry_tag,
+        "role_focus_tag": role_focus_tag,
+        "site_names": site_names,
+        "preferred_companies": preferred_companies,
+        "preferred_locations": preferred_locations,
+        "search_skills_str": search_skills_str,
+    }
+
+if st.session_state["clean_jobs_df"] is not None:
+    clean_jobs = st.session_state["clean_jobs_df"].copy()
+    raw_jobs = st.session_state["raw_jobs_df"].copy()
+    summary = st.session_state["search_summary"]
 
     total_scraped = len(raw_jobs)
     unique_in_run = len(clean_jobs)
@@ -522,33 +632,31 @@ if run_search:
         use_container_width=True
     )
 
-    save_raw = st.checkbox("Also save raw scrape to raw_jobs_archive", value=False)
+    if st.button("SAVE", type="primary"):
+        master_to_save = clean_jobs.drop(columns=["already_in_master"]).copy()
 
-    if st.button("Save unique cleaned rows to master_jobs"):
         saved_count, duplicates_skipped = append_unique_rows(
             conn=conn,
             worksheet=MASTER_SHEET,
-            new_df=clean_jobs.drop(columns=["already_in_master"]),
+            new_df=master_to_save,
             key_col="job_uid"
         )
 
-        if save_raw:
-            raw_copy = raw_jobs.copy()
-            raw_copy["team_member"] = team_member
-            raw_copy["search_term"] = search_term
-            raw_copy["date_scraped"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            existing_raw = read_sheet_safe(conn, RAW_SHEET)
-            updated_raw = pd.concat([existing_raw, raw_copy], ignore_index=True)
-            conn.update(worksheet=RAW_SHEET, data=updated_raw)
+        raw_copy = raw_jobs.copy()
+        raw_copy["team_member"] = summary["team_member"]
+        raw_copy["search_term"] = summary["search_term"]
+        raw_copy["date_scraped"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        existing_raw = read_sheet_safe(conn, RAW_SHEET)
+        updated_raw = pd.concat([existing_raw, raw_copy], ignore_index=True)
+        conn.update(worksheet=RAW_SHEET, data=updated_raw)
 
         log_run(conn, {
             "run_id": str(uuid.uuid4())[:8],
             "run_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "team_member": team_member,
-            "search_term": search_term,
-            "location": location,
-            "sites": ", ".join(site_names),
-            "results_requested": results_wanted,
+            "team_member": summary["team_member"],
+            "search_term": summary["search_term"],
+            "results_requested": summary["results_requested"],
             "raw_scraped": total_scraped,
             "unique_in_run": unique_in_run,
             "already_in_master": already_in_master,
@@ -556,8 +664,12 @@ if run_search:
             "duplicates_skipped": duplicates_skipped,
             "missing_salary": missing_salary,
             "missing_description": missing_description,
-            "industry_tag": industry_tag,
-            "role_focus_tag": role_focus_tag,
+            "industry_tag": summary["industry_tag"],
+            "role_focus_tag": summary["role_focus_tag"],
         })
 
-        st.success(f"Saved {saved_count} new unique rows to {MASTER_SHEET}. Skipped {duplicates_skipped} duplicates.")
+        st.success(f"Saved {saved_count} new unique rows to {MASTER_SHEET} and archived raw rows to {RAW_SHEET}.")
+
+        st.session_state["raw_jobs_df"] = None
+        st.session_state["clean_jobs_df"] = None
+        st.session_state["search_summary"] = None
