@@ -25,7 +25,7 @@ INDUSTRY_OPTIONS = [
     "Public Sector",
     "Manufacturing",
     "Education",
-    "Other"
+    "Other",
 ]
 
 SKILL_OPTIONS = [
@@ -34,7 +34,7 @@ SKILL_OPTIONS = [
     "stakeholder management", "communication", "financial modeling", "strategy",
     "consulting", "project management", "powerpoint", "stakeholder", "client",
     "business case", "operating model", "transformation", "automation",
-    "advisory", "management consulting", "roadmap"
+    "advisory", "management consulting", "roadmap",
 ]
 
 DEFAULT_SITE_OPTIONS = ["linkedin", "indeed", "glassdoor"]
@@ -86,6 +86,7 @@ DEFAULT_COLUMNS = [
     "remote_status",
     "job_url",
     "site",
+    "is_linkedin",
     "date_posted",
     "date_scraped",
     "employment_type",
@@ -170,7 +171,23 @@ def parse_city_state(location_raw):
     text = re.sub(r"\s+", " ", text)
 
     lowered = text.lower()
-    if lowered in ["remote", "hybrid", "united states", "usa"]:
+
+    broad_locations = {
+        "remote",
+        "hybrid",
+        "us",
+        "u.s.",
+        "usa",
+        "united states",
+        "california, united states",
+        "new york, united states",
+        "texas, united states",
+        "ca, us",
+        "ny, us",
+        "tx, us",
+    }
+
+    if lowered in broad_locations:
         return "", ""
 
     parts = [p.strip() for p in text.split(",") if p.strip()]
@@ -186,18 +203,22 @@ def parse_city_state(location_raw):
         if state_name in STATE_NAME_TO_ABBR:
             return city, STATE_NAME_TO_ABBR[state_name]
 
+        if parts[0].lower() in STATE_NAME_TO_ABBR and "united states" in lowered:
+            return "", STATE_NAME_TO_ABBR[parts[0].lower()]
+
     tokens = text.split()
+
     if len(tokens) >= 2 and tokens[-1].upper() in STATE_ABBR:
         return " ".join(tokens[:-1]).strip(), tokens[-1].upper()
 
     if len(tokens) >= 2:
-        maybe_state = " ".join(tokens[-2:]).lower()
-        if maybe_state in STATE_NAME_TO_ABBR:
-            return " ".join(tokens[:-2]).strip(), STATE_NAME_TO_ABBR[maybe_state]
+        maybe_state_two = " ".join(tokens[-2:]).lower()
+        if maybe_state_two in STATE_NAME_TO_ABBR:
+            return " ".join(tokens[:-2]).strip(), STATE_NAME_TO_ABBR[maybe_state_two]
 
-        maybe_state = tokens[-1].lower()
-        if maybe_state in STATE_NAME_TO_ABBR:
-            return " ".join(tokens[:-1]).strip(), STATE_NAME_TO_ABBR[maybe_state]
+        maybe_state_one = tokens[-1].lower()
+        if maybe_state_one in STATE_NAME_TO_ABBR:
+            return " ".join(tokens[:-1]).strip(), STATE_NAME_TO_ABBR[maybe_state_one]
 
     return text, ""
 
@@ -218,29 +239,47 @@ def text_contains_any(text, patterns):
     return int(any(re.search(p, t) for p in patterns))
 
 
-def infer_experience_level(description, title=""):
-    combined = f"{normalize_text(title)} {normalize_text(description)}"
-    for level, patterns in EXP_PATTERNS.items():
-        if any(re.search(p, combined) for p in patterns):
-            return level
-    return "Unknown"
-
-
 def infer_experience_years_min(description):
-    if pd.isna(description):
+    if pd.isna(description) or not str(description).strip():
         return None
 
     text = normalize_text(description)
     patterns = [
-        r"(\d+)\+?\s+years",
         r"minimum of (\d+)\s+years",
         r"at least (\d+)\s+years",
+        r"(\d+)\+?\s+years",
+        r"(\d+)\s*-\s*(\d+)\s+years",
     ]
+
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
+            if len(match.groups()) == 2:
+                return int(match.group(1))
             return int(match.group(1))
+
     return None
+
+
+def infer_experience_level(description, title="", years_min=None):
+    if years_min is not None and pd.notna(years_min):
+        try:
+            years = float(years_min)
+            if years >= 5:
+                return "Senior"
+            elif years >= 3:
+                return "Mid"
+            elif years >= 0:
+                return "Entry"
+        except Exception:
+            pass
+
+    combined = f"{normalize_text(title)} {normalize_text(description)}"
+    for level, patterns in EXP_PATTERNS.items():
+        if any(re.search(p, combined) for p in patterns):
+            return level
+
+    return "Unknown"
 
 
 def annualize_salary(min_val, max_val, interval):
@@ -281,7 +320,13 @@ def parse_salary_from_description(description):
             min_val = float(match.group(1))
             max_val = float(match.group(2))
             interval = match.group(3).lower()
-            interval = {"hour": "hourly", "year": "yearly", "month": "monthly", "week": "weekly", "day": "daily"}[interval]
+            interval = {
+                "hour": "hourly",
+                "year": "yearly",
+                "month": "monthly",
+                "week": "weekly",
+                "day": "daily",
+            }[interval]
             return min_val, max_val, "USD", interval, "description"
 
     pattern_single = r"\$ ?(\d+(?:\.\d+)?)\s*(?:per|a)?\s*(hour|year|month|week|day)"
@@ -289,7 +334,13 @@ def parse_salary_from_description(description):
     if match:
         amount = float(match.group(1))
         interval = match.group(2).lower()
-        interval = {"hour": "hourly", "year": "yearly", "month": "monthly", "week": "weekly", "day": "daily"}[interval]
+        interval = {
+            "hour": "hourly",
+            "year": "yearly",
+            "month": "monthly",
+            "week": "weekly",
+            "day": "daily",
+        }[interval]
         return amount, amount, "USD", interval, "description"
 
     return None, None, None, None, None
@@ -317,8 +368,16 @@ def build_search_term(target_roles, companies, locations, selected_skills):
     return " ".join(parts).strip()
 
 
-def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_tag,
-                     search_skills="", search_companies="", search_locations=""):
+def standardize_jobs(
+    raw_df,
+    team_member,
+    search_term,
+    industry_tag,
+    role_focus_tag,
+    search_skills="",
+    search_companies="",
+    search_locations=""
+):
     if raw_df is None or raw_df.empty:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
 
@@ -359,7 +418,9 @@ def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_
     df["search_skills"] = search_skills
     df["search_companies"] = search_companies
     df["search_locations"] = search_locations
-    df["salary_source"] = "structured"
+    df["is_linkedin"] = (df["site"].astype(str).str.lower() == "linkedin").astype(int)
+
+    df["salary_source"] = "missing"
 
     desc_salary = df["description"].apply(parse_salary_from_description)
     df["desc_salary_min"] = desc_salary.apply(lambda x: x[0])
@@ -368,18 +429,27 @@ def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_
     df["desc_salary_interval"] = desc_salary.apply(lambda x: x[3])
     df["desc_salary_source"] = desc_salary.apply(lambda x: x[4])
 
-    missing_structured = df["salary_min"].isna() & df["salary_max"].isna()
+    has_structured_salary = df["salary_min"].notna() | df["salary_max"].notna()
+    df.loc[has_structured_salary, "salary_source"] = "structured"
+
+    missing_structured = ~has_structured_salary
     df.loc[missing_structured, "salary_min"] = df.loc[missing_structured, "desc_salary_min"]
     df.loc[missing_structured, "salary_max"] = df.loc[missing_structured, "desc_salary_max"]
     df.loc[missing_structured, "salary_currency"] = df.loc[missing_structured, "desc_salary_currency"]
     df.loc[missing_structured, "salary_interval"] = df.loc[missing_structured, "desc_salary_interval"]
-    df.loc[missing_structured & df["desc_salary_source"].notna(), "salary_source"] = "description"
 
+    has_desc_salary = df["desc_salary_source"].notna()
+    df.loc[missing_structured & has_desc_salary, "salary_source"] = "description"
+
+    df["experience_years_min"] = df["description"].apply(infer_experience_years_min)
     df["experience_level"] = df.apply(
-        lambda row: infer_experience_level(row["description"], row["job_title"]),
+        lambda row: infer_experience_level(
+            row["description"],
+            row["job_title"],
+            row["experience_years_min"]
+        ),
         axis=1
     )
-    df["experience_years_min"] = df["description"].apply(infer_experience_years_min)
 
     for skill_col, patterns in SKILL_PATTERNS.items():
         df[skill_col] = df["description"].fillna("").apply(lambda x: text_contains_any(x, patterns))
@@ -404,6 +474,7 @@ def standardize_jobs(raw_df, team_member, search_term, industry_tag, role_focus_
     df = ensure_columns(df, DEFAULT_COLUMNS)
     df = df[DEFAULT_COLUMNS].copy()
     df = df.drop_duplicates(subset=["job_uid"], keep="first")
+
     return df
 
 
@@ -439,20 +510,6 @@ def log_run(conn, payload):
     existing = read_sheet_safe(conn, LOG_SHEET)
     updated = pd.concat([existing, pd.DataFrame([payload])], ignore_index=True)
     conn.update(worksheet=LOG_SHEET, data=updated)
-
-
-def initialize_sheet_tabs(conn):
-    empty_master = pd.DataFrame(columns=DEFAULT_COLUMNS)
-    empty_raw = pd.DataFrame(columns=["date_scraped", "team_member", "search_term"])
-    empty_log = pd.DataFrame(columns=[
-        "run_id", "run_timestamp", "team_member", "search_term", "results_requested",
-        "raw_scraped", "unique_in_run", "already_in_master", "saved_to_master",
-        "duplicates_skipped", "missing_salary", "missing_description",
-        "industry_tag", "role_focus_tag"
-    ])
-    conn.update(worksheet=MASTER_SHEET, data=empty_master)
-    conn.update(worksheet=RAW_SHEET, data=empty_raw)
-    conn.update(worksheet=LOG_SHEET, data=empty_log)
 
 
 init_state()
@@ -527,15 +584,19 @@ with st.sidebar:
     )
     st.markdown('<div class="small-grey">Please input number only</div>', unsafe_allow_html=True)
 
-    st.divider()
-    if st.button("Initialize / Reset 3 tabs"):
-        initialize_sheet_tabs(conn)
-        st.success("Tabs initialized.")
 
-industry_tag = ", ".join([x for x in selected_industries if x != "Other"] + ([other_industry.strip()] if other_industry.strip() else []))
+industry_tag = ", ".join(
+    [x for x in selected_industries if x != "Other"] +
+    ([other_industry.strip()] if other_industry.strip() else [])
+)
 role_focus_tag = ", ".join(selected_role_focus)
 search_skills_str = ", ".join(selected_skills)
-search_term = build_search_term(target_roles, preferred_companies, preferred_locations, selected_skills)
+search_term = build_search_term(
+    target_roles,
+    preferred_companies,
+    preferred_locations,
+    selected_skills
+)
 
 run_search = st.button("Run Search")
 
@@ -584,7 +645,11 @@ if run_search:
     )
 
     existing_master = read_sheet_safe(conn, MASTER_SHEET)
-    existing_keys = set(existing_master["job_uid"].astype(str).tolist()) if not existing_master.empty and "job_uid" in existing_master.columns else set()
+    existing_keys = (
+        set(existing_master["job_uid"].astype(str).tolist())
+        if not existing_master.empty and "job_uid" in existing_master.columns
+        else set()
+    )
 
     clean_jobs["already_in_master"] = clean_jobs["job_uid"].astype(str).isin(existing_keys).astype(int)
 
@@ -627,6 +692,7 @@ if st.session_state["clean_jobs_df"] is not None:
             "job_title", "company", "city", "state", "remote_status",
             "salary_min", "salary_max", "salary_interval", "salary_source",
             "salary_annual_min", "salary_annual_max", "experience_level",
+            "experience_years_min", "is_linkedin",
             "python_required", "sql_required", "ml_required", "already_in_master"
         ]],
         use_container_width=True
@@ -668,7 +734,10 @@ if st.session_state["clean_jobs_df"] is not None:
             "role_focus_tag": summary["role_focus_tag"],
         })
 
-        st.success(f"Saved {saved_count} new unique rows to {MASTER_SHEET} and archived raw rows to {RAW_SHEET}.")
+        st.success(
+            f"Saved {saved_count} new unique rows to {MASTER_SHEET} "
+            f"and archived raw rows to {RAW_SHEET}."
+        )
 
         st.session_state["raw_jobs_df"] = None
         st.session_state["clean_jobs_df"] = None
